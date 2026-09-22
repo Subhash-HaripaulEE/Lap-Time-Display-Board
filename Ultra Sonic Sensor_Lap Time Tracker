@@ -1,0 +1,248 @@
+#include <LiquidCrystal.h>
+
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+// HC-SR04
+const int trigPin = 9;
+const int echoPin = 10;
+
+// Detection settings
+const float detectionDistance = 50.0;
+const unsigned long minimumDetectionTime = 75;
+
+int lapCount = 0;
+
+unsigned long previousLapTime = 0;
+unsigned long currentTime = 0;
+
+// Detection state
+bool objectDetected = false;
+bool checkingObject = false;
+
+unsigned long detectionStartTime = 0;
+
+// --------------------------------
+// LAP STATISTICS
+// --------------------------------
+
+unsigned long mostRecentLap = 0;
+unsigned long bestLap = 0;
+unsigned long worstLap = 0;
+unsigned long totalLapTime = 0;
+
+
+void setup() {
+
+  Serial.begin(9600);
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  lcd.begin(16, 2);
+
+  lcd.setCursor(0, 0);
+  lcd.print("LAP TIMER");
+
+  lcd.setCursor(0, 1);
+  lcd.print("READY");
+
+  Serial.println("LAP TIMER READY");
+  Serial.println("----------------");
+}
+
+
+void loop() {
+
+  // --------------------------------
+  // SEND ULTRASONIC PULSE
+  // --------------------------------
+
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(trigPin, LOW);
+
+
+  // --------------------------------
+  // READ ECHO
+  // --------------------------------
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+
+
+  // --------------------------------
+  // CALCULATE DISTANCE
+  // --------------------------------
+
+  float distance = duration * 0.0343 / 2;
+
+
+  // --------------------------------
+  // OBJECT ENTERS DETECTION AREA
+  // --------------------------------
+
+  if (distance > 0 && distance <= detectionDistance) {
+
+    // Start checking the object
+    if (!checkingObject && !objectDetected) {
+
+      checkingObject = true;
+      detectionStartTime = millis();
+    }
+
+
+    // Has it remained detected long enough?
+    if (checkingObject &&
+        !objectDetected &&
+        millis() - detectionStartTime >= minimumDetectionTime) {
+
+      objectDetected = true;
+      checkingObject = false;
+
+      currentTime = millis();
+
+
+      // --------------------------------
+      // FIRST DETECTION
+      // START TIMER
+      // --------------------------------
+
+      if (lapCount == 0) {
+
+        previousLapTime = currentTime;
+
+        lapCount = 1;
+
+        lcd.clear();
+
+        lcd.setCursor(0, 0);
+        lcd.print("TIMER STARTED");
+
+        lcd.setCursor(0, 1);
+        lcd.print("LAP: 0");
+
+        Serial.println("TIMER STARTED");
+      }
+
+
+      // --------------------------------
+      // NEW LAP
+      // --------------------------------
+
+      else {
+
+        unsigned long lapTime =
+          currentTime - previousLapTime;
+
+
+        // Save most recent lap
+        mostRecentLap = lapTime;
+
+
+        // Add lap to total
+        totalLapTime = totalLapTime + lapTime;
+
+
+        // --------------------------------
+        // BEST LAP
+        // --------------------------------
+
+        if (bestLap == 0 || lapTime < bestLap) {
+
+          bestLap = lapTime;
+        }
+
+
+        // --------------------------------
+        // WORST LAP
+        // --------------------------------
+
+        if (lapTime > worstLap) {
+
+          worstLap = lapTime;
+        }
+
+
+        // --------------------------------
+        // AVERAGE LAP
+        // --------------------------------
+
+        // lapCount represents the number
+        // of completed laps before incrementing
+
+        float averageLap =
+          (float)totalLapTime / lapCount;
+
+
+        // --------------------------------
+        // LCD
+        // --------------------------------
+
+        lcd.clear();
+
+        lcd.setCursor(0, 0);
+        lcd.print("LAP: ");
+        lcd.print(lapCount);
+
+        lcd.setCursor(0, 1);
+        lcd.print("TIME: ");
+        lcd.print(lapTime / 1000.0, 2);
+        lcd.print(" s");
+
+
+        // --------------------------------
+        // SERIAL MONITOR
+        // --------------------------------
+
+        Serial.println();
+
+        Serial.print("Lap ");
+        Serial.print(lapCount);
+        Serial.print(": ");
+        Serial.print(lapTime / 1000.0, 2);
+        Serial.println(" seconds");
+
+        Serial.print("Most Recent: ");
+        Serial.print(mostRecentLap / 1000.0, 2);
+        Serial.println(" seconds");
+
+        Serial.print("Best: ");
+        Serial.print(bestLap / 1000.0, 2);
+        Serial.println(" seconds");
+
+        Serial.print("Worst: ");
+        Serial.print(worstLap / 1000.0, 2);
+        Serial.println(" seconds");
+
+        Serial.print("Average: ");
+        Serial.print(averageLap / 1000.0, 2);
+        Serial.println(" seconds");
+
+        Serial.println("----------------");
+
+
+        // Prepare for next lap
+        previousLapTime = currentTime;
+
+        lapCount++;
+      }
+    }
+  }
+
+
+  // --------------------------------
+  // OBJECT LEAVES DETECTION AREA
+  // --------------------------------
+
+  else {
+
+    checkingObject = false;
+    objectDetected = false;
+  }
+
+
+  delay(20);
+}
