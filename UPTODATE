@@ -1,0 +1,1049 @@
+#include <LiquidCrystal.h>
+#include <IRremote.hpp>
+
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+
+// =================================
+// HC-SR04
+// =================================
+
+const int trigPin = 9;
+const int echoPin = 10;
+
+
+// =================================
+// IR REMOTE
+// =================================
+
+const int IR_RECEIVE_PIN = 6;
+
+// Learned button commands
+uint16_t MANUAL_LAP_COMMAND = 69;
+uint16_t PIT_STOP_COMMAND = 68;
+
+// Button learning
+bool powerLearned = false;
+bool pitLearned = false;
+
+uint16_t learnedAddress = 0;
+decode_type_t learnedProtocol = UNKNOWN;
+
+// Prevent one button press from
+// being counted multiple times
+const unsigned long remoteCooldown = 500;
+
+unsigned long lastRemoteLapTime = 0;
+unsigned long lastPitCommandTime = 0;
+
+
+// =================================
+// DETECTION SETTINGS
+// =================================
+
+const float detectionDistance = 50.0;
+
+const unsigned long minimumDetectionTime = 75;
+
+
+// =================================
+// TIMER VARIABLES
+// =================================
+
+int lapCount = 0;
+
+unsigned long previousLapTime = 0;
+unsigned long currentTime = 0;
+
+
+// =================================
+// TIMER STATE
+// =================================
+
+bool timerRunning = false;
+
+// True after Play/Pause is pressed.
+// Current lap will finish, then timer stops.
+bool stopAfterCurrentLap = false;
+
+// True while system is in pit stop
+bool inPitStop = false;
+
+
+// =================================
+// ULTRASONIC DETECTION STATE
+// =================================
+
+bool objectDetected = false;
+bool checkingObject = false;
+
+unsigned long detectionStartTime = 0;
+
+
+// =================================
+// LAP STATISTICS
+// =================================
+
+unsigned long mostRecentLap = 0;
+unsigned long bestLap = 0;
+unsigned long worstLap = 0;
+unsigned long totalLapTime = 0;
+
+// Remember which lap produced
+// the best and worst times
+int bestLapNumber = 0;
+int worstLapNumber = 0;
+
+
+// =================================
+// LIVE TIMER DISPLAY
+// =================================
+
+unsigned long lastDisplayUpdate = 0;
+
+const unsigned long displayUpdateInterval = 100;
+
+
+// =================================
+// PIT STOP DISPLAY
+// =================================
+
+unsigned long lastPitDisplayChange = 0;
+
+const unsigned long pitDisplayInterval = 3000;
+
+// 0 = Pit Stop
+// 1 = Best Lap
+// 2 = Worst Lap
+// 3 = Average + Most Recent
+int pitDisplayPage = 0;
+
+
+// =================================
+// RESET LAP STATISTICS
+// =================================
+
+void resetLapStatistics() {
+
+  lapCount = 0;
+
+  previousLapTime = 0;
+  currentTime = 0;
+
+  mostRecentLap = 0;
+  bestLap = 0;
+  worstLap = 0;
+  totalLapTime = 0;
+
+  bestLapNumber = 0;
+  worstLapNumber = 0;
+}
+
+
+// =================================
+// START BRAND NEW RACE
+// =================================
+
+void startNewRace() {
+
+  // ONLY a completely new race
+  // resets the statistics.
+  resetLapStatistics();
+
+  stopAfterCurrentLap = false;
+
+  inPitStop = false;
+
+  timerRunning = true;
+
+  currentTime = millis();
+
+  previousLapTime = currentTime;
+
+  // Start at Lap 1
+  lapCount = 1;
+
+  lastDisplayUpdate = currentTime;
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("LAP: 1");
+
+  lcd.setCursor(0, 1);
+  lcd.print("TIME: 0.00 s");
+
+  Serial.println();
+  Serial.println("NEW RACE STARTED");
+  Serial.println("----------------");
+}
+
+
+// =================================
+// RESUME AFTER PIT STOP
+// =================================
+
+void resumeAfterPitStop() {
+
+  // Leave pit mode
+  inPitStop = false;
+
+  // Start timing again
+  timerRunning = true;
+
+  stopAfterCurrentLap = false;
+
+  // IMPORTANT:
+  // DO NOT reset lapCount.
+  // DO NOT reset statistics.
+
+  previousLapTime = millis();
+
+  currentTime = previousLapTime;
+
+  lastDisplayUpdate = currentTime;
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("LAP: ");
+  lcd.print(lapCount);
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("TIME: 0.00 s");
+
+  Serial.println();
+  Serial.println("PIT STOP COMPLETE");
+
+  Serial.print("RESUMING LAP ");
+  Serial.println(lapCount);
+
+  Serial.println("----------------");
+}
+
+
+// =================================
+// STOP TIMER / ENTER PIT STOP
+// =================================
+
+void stopTimer() {
+
+  timerRunning = false;
+
+  stopAfterCurrentLap = false;
+
+  inPitStop = true;
+
+  // Start pit-stop display
+  pitDisplayPage = 0;
+
+  lastPitDisplayChange = millis();
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("PIT STOP");
+
+  lcd.setCursor(0, 1);
+  lcd.print("STAND BY");
+
+  Serial.println();
+  Serial.println("PIT STOP");
+  Serial.println("TIMER STOPPED");
+  Serial.println("----------------");
+}
+
+
+// =================================
+// DISPLAY PIT STOP PAGE
+// =================================
+
+void displayPitStopPage() {
+
+  lcd.clear();
+
+
+  // =================================
+  // PAGE 0 - PIT STOP
+  // =================================
+
+  if (pitDisplayPage == 0) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("PIT STOP");
+
+    lcd.setCursor(0, 1);
+    lcd.print("STAND BY");
+  }
+
+
+  // =================================
+  // PAGE 1 - BEST LAP
+  // =================================
+
+  else if (pitDisplayPage == 1) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("BEST LAP: ");
+    lcd.print(bestLapNumber);
+
+    lcd.setCursor(0, 1);
+    lcd.print("TIME: ");
+    lcd.print(bestLap / 1000.0, 2);
+    lcd.print(" s");
+  }
+
+
+  // =================================
+  // PAGE 2 - WORST LAP
+  // =================================
+
+  else if (pitDisplayPage == 2) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("WORST LAP: ");
+    lcd.print(worstLapNumber);
+
+    lcd.setCursor(0, 1);
+    lcd.print("TIME: ");
+    lcd.print(worstLap / 1000.0, 2);
+    lcd.print(" s");
+  }
+
+
+  // =================================
+  // PAGE 3 - AVERAGE + MOST RECENT
+  // =================================
+
+  else if (pitDisplayPage == 3) {
+
+    float averageLap = 0;
+
+    int completedLaps = lapCount - 1;
+
+    if (completedLaps > 0) {
+
+      averageLap =
+        (float)totalLapTime / completedLaps;
+    }
+
+    lcd.setCursor(0, 0);
+
+    lcd.print("AVG: ");
+    lcd.print(averageLap / 1000.0, 2);
+    lcd.print(" s");
+
+    lcd.setCursor(0, 1);
+
+    lcd.print("RECENT: ");
+    lcd.print(mostRecentLap / 1000.0, 2);
+    lcd.print(" s");
+  }
+}
+
+
+// =================================
+// UPDATE PIT STOP DISPLAY
+// =================================
+
+void updatePitStopDisplay() {
+
+  if (!inPitStop) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Change page every 3 seconds
+  if (now - lastPitDisplayChange >=
+      pitDisplayInterval) {
+
+    lastPitDisplayChange = now;
+
+    pitDisplayPage++;
+
+    // Cycle back to first page
+    if (pitDisplayPage > 3) {
+
+      pitDisplayPage = 0;
+    }
+
+    // LCD only
+    displayPitStopPage();
+  }
+}
+
+
+// =================================
+// UPDATE LIVE TIMER
+// =================================
+
+void updateLiveTimer() {
+
+  if (!timerRunning) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Update display every 100 ms
+  if (now - lastDisplayUpdate >=
+      displayUpdateInterval) {
+
+    lastDisplayUpdate = now;
+
+    unsigned long liveLapTime =
+      now - previousLapTime;
+
+
+    // =================================
+    // UPDATE LCD
+    // =================================
+
+    lcd.setCursor(0, 0);
+
+    lcd.print("LAP: ");
+    lcd.print(lapCount);
+
+
+    // Show * if pit stop requested
+    if (stopAfterCurrentLap) {
+
+      lcd.print(" *");
+    }
+
+    // Clear leftover characters
+    lcd.print("       ");
+
+
+    lcd.setCursor(0, 1);
+
+    lcd.print("TIME: ");
+
+    lcd.print(liveLapTime / 1000.0, 2);
+
+    lcd.print(" s   ");
+  }
+}
+
+
+// =================================
+// RECORD LAP
+// =================================
+
+void recordLap() {
+
+  currentTime = millis();
+
+
+  // =================================
+  // TIMER NOT RUNNING
+  // =================================
+
+  if (!timerRunning) {
+
+    // If we're in pit stop,
+    // resume the existing race.
+    if (inPitStop) {
+
+      resumeAfterPitStop();
+
+      return;
+    }
+
+    // Otherwise start a completely
+    // new race.
+    startNewRace();
+
+    return;
+  }
+
+
+  // =================================
+  // CALCULATE LAP
+  // =================================
+
+  unsigned long lapTime =
+    currentTime - previousLapTime;
+
+
+  // Save most recent lap
+  mostRecentLap = lapTime;
+
+
+  // Add to total
+  totalLapTime =
+    totalLapTime + lapTime;
+
+
+  // =================================
+  // BEST LAP
+  // =================================
+
+  if (bestLap == 0 ||
+      lapTime < bestLap) {
+
+    bestLap = lapTime;
+
+    bestLapNumber = lapCount;
+  }
+
+
+  // =================================
+  // WORST LAP
+  // =================================
+
+  if (lapTime > worstLap) {
+
+    worstLap = lapTime;
+
+    worstLapNumber = lapCount;
+  }
+
+
+  // =================================
+  // AVERAGE
+  // =================================
+
+  float averageLap =
+    (float)totalLapTime / lapCount;
+
+
+  // =================================
+  // LCD
+  // =================================
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("LAP: ");
+  lcd.print(lapCount);
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("TIME: ");
+
+  lcd.print(lapTime / 1000.0, 2);
+
+  lcd.print(" s");
+
+
+  // =================================
+  // SERIAL MONITOR
+  // =================================
+
+  Serial.println();
+
+  Serial.print("Lap ");
+  Serial.print(lapCount);
+  Serial.print(": ");
+
+  Serial.print(lapTime / 1000.0, 2);
+
+  Serial.println(" seconds");
+
+
+  Serial.print("Most Recent: ");
+
+  Serial.print(mostRecentLap / 1000.0, 2);
+
+  Serial.println(" seconds");
+
+
+  Serial.print("Best: ");
+
+  Serial.print(bestLap / 1000.0, 2);
+
+  Serial.println(" seconds");
+
+
+  Serial.print("Worst: ");
+
+  Serial.print(worstLap / 1000.0, 2);
+
+  Serial.println(" seconds");
+
+
+  Serial.print("Average: ");
+
+  Serial.print(averageLap / 1000.0, 2);
+
+  Serial.println(" seconds");
+
+  Serial.println("----------------");
+
+
+  // =================================
+  // PREPARE NEXT LAP
+  // =================================
+
+  previousLapTime = currentTime;
+
+  lapCount++;
+
+
+  // =================================
+  // PIT STOP REQUESTED?
+  // =================================
+
+  if (stopAfterCurrentLap) {
+
+    stopTimer();
+  }
+}
+
+
+// =================================
+// LEARN REMOTE BUTTONS
+// =================================
+
+void learnRemoteButton(
+  uint16_t command,
+  uint16_t address,
+  decode_type_t protocol
+) {
+
+  // =================================
+  // LEARN POWER
+  // =================================
+
+  if (!powerLearned) {
+
+    MANUAL_LAP_COMMAND = command;
+
+    learnedAddress = address;
+    learnedProtocol = protocol;
+
+    powerLearned = true;
+
+    Serial.println();
+    Serial.println("POWER BUTTON LEARNED");
+
+    Serial.print("POWER COMMAND: ");
+    Serial.println(MANUAL_LAP_COMMAND);
+
+    Serial.println("NOW PRESS PLAY/PAUSE");
+    Serial.println("----------------");
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("POWER SAVED");
+
+    lcd.setCursor(0, 1);
+    lcd.print("PRESS PLAY/PAUSE");
+
+    return;
+  }
+
+
+  // =================================
+  // LEARN PLAY/PAUSE
+  // =================================
+
+  if (!pitLearned) {
+
+    // Do not save Power twice.
+    if (command == MANUAL_LAP_COMMAND &&
+        address == learnedAddress &&
+        protocol == learnedProtocol) {
+
+      Serial.println("PRESS PLAY/PAUSE INSTEAD");
+      return;
+    }
+
+    if (address != learnedAddress ||
+        protocol != learnedProtocol) {
+
+      Serial.println("DIFFERENT REMOTE DETECTED");
+      return;
+    }
+
+    PIT_STOP_COMMAND = command;
+
+    pitLearned = true;
+
+    Serial.println();
+    Serial.println("PLAY/PAUSE BUTTON LEARNED");
+
+    Serial.print("POWER COMMAND: ");
+    Serial.println(MANUAL_LAP_COMMAND);
+
+    Serial.print("PLAY/PAUSE COMMAND: ");
+    Serial.println(PIT_STOP_COMMAND);
+
+    Serial.println();
+    Serial.println("REMOTE READY");
+    Serial.println("----------------");
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("REMOTE READY");
+
+    lcd.setCursor(0, 1);
+    lcd.print("LAP TIMER READY");
+  }
+}
+
+
+// =================================
+// SETUP
+// =================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+
+  // =================================
+  // ULTRASONIC
+  // =================================
+
+  pinMode(trigPin, OUTPUT);
+
+  pinMode(echoPin, INPUT);
+
+
+  // =================================
+  // IR RECEIVER
+  // =================================
+
+  IrReceiver.begin(
+    IR_RECEIVE_PIN,
+    ENABLE_LED_FEEDBACK
+  );
+
+
+  // =================================
+  // LCD
+  // =================================
+
+  lcd.begin(16, 2);
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("PRESS POWER");
+
+  lcd.setCursor(0, 1);
+
+  lcd.print("ON IR REMOTE");
+
+
+  // =================================
+  // SERIAL STARTUP
+  // =================================
+
+  Serial.println("LAP TIMER READY");
+
+  Serial.println("----------------");
+
+  Serial.println("BLACK IR RECEIVER ON D6");
+
+  Serial.println("PRESS POWER TO LEARN");
+
+  Serial.println("THEN PRESS PLAY/PAUSE");
+
+  Serial.println("LIVE TIMER ENABLED");
+
+  Serial.println("LIVE TIMER NOT PRINTED");
+
+  Serial.println("TO SERIAL");
+
+  Serial.println("----------------");
+}
+
+
+// =================================
+// MAIN LOOP
+// =================================
+
+void loop() {
+
+
+  // =================================
+  // CHECK IR REMOTE
+  // =================================
+
+  if (IrReceiver.decode()) {
+
+    uint16_t command =
+      IrReceiver.decodedIRData.command;
+
+    uint16_t address =
+      IrReceiver.decodedIRData.address;
+
+    decode_type_t protocol =
+      IrReceiver.decodedIRData.protocol;
+
+    bool isRepeat =
+      IrReceiver.decodedIRData.flags &
+      IRDATA_FLAGS_IS_REPEAT;
+
+    unsigned long now = millis();
+
+
+    // =================================
+    // IR DEBUGGING
+    // =================================
+
+    if (!isRepeat) {
+
+      Serial.println();
+
+      Serial.print("IR COMMAND: ");
+      Serial.println(command);
+
+      Serial.print("IR ADDRESS: ");
+      Serial.println(address);
+
+      Serial.print("IR PROTOCOL: ");
+      Serial.println(
+        getProtocolString(protocol)
+      );
+
+      Serial.println("----------------");
+    }
+
+
+    // =================================
+    // IGNORE REPEATS / UNKNOWN
+    // =================================
+
+    if (isRepeat || protocol == UNKNOWN) {
+
+      IrReceiver.resume();
+    }
+
+
+    // =================================
+    // LEARN BUTTONS
+    // =================================
+
+    else if (!powerLearned || !pitLearned) {
+
+      learnRemoteButton(
+        command,
+        address,
+        protocol
+      );
+
+      IrReceiver.resume();
+    }
+
+
+    // =================================
+    // CHECK LEARNED REMOTE
+    // =================================
+
+    else {
+
+      bool correctRemote =
+        address == learnedAddress &&
+        protocol == learnedProtocol;
+
+
+      // =================================
+      // POWER = MANUAL LAP / RESUME
+      // =================================
+
+      if (correctRemote &&
+          command == MANUAL_LAP_COMMAND) {
+
+        if (now - lastRemoteLapTime >=
+            remoteCooldown) {
+
+          Serial.println();
+          Serial.println("MANUAL LAP - POWER");
+
+          recordLap();
+
+          lastRemoteLapTime = now;
+        }
+      }
+
+
+      // =================================
+      // PLAY/PAUSE
+      // =================================
+
+      else if (correctRemote &&
+               command == PIT_STOP_COMMAND) {
+
+        if (now - lastPitCommandTime >=
+            remoteCooldown) {
+
+
+          // =================================
+          // IF IN PIT STOP
+          // RESUME RACE
+          // =================================
+
+          if (inPitStop) {
+
+            Serial.println();
+            Serial.println("PIT STOP RESUME");
+            Serial.println("RESUMING RACE");
+            Serial.println("----------------");
+
+            resumeAfterPitStop();
+          }
+
+
+          // =================================
+          // IF RACING
+          // REQUEST PIT STOP
+          // =================================
+
+          else if (timerRunning) {
+
+            stopAfterCurrentLap = true;
+
+
+            Serial.println();
+
+            Serial.println("PIT STOP REQUESTED");
+
+            Serial.println("CURRENT LAP WILL FINISH");
+
+            Serial.println("THEN TIMER WILL STOP");
+
+            Serial.println("----------------");
+
+
+            // =================================
+            // LCD PIT INDICATOR
+            // =================================
+
+            lcd.clear();
+
+            lcd.setCursor(0, 0);
+
+            lcd.print("LAP: ");
+
+            lcd.print(lapCount);
+
+            lcd.print(" *");
+
+
+            lcd.setCursor(0, 1);
+
+            lcd.print("PIT AFTER LAP");
+          }
+
+
+          lastPitCommandTime = now;
+        }
+      }
+
+
+      // Prepare IR receiver
+      IrReceiver.resume();
+    }
+  }
+
+
+  // =================================
+  // UPDATE LIVE TIMER
+  // =================================
+
+  updateLiveTimer();
+
+
+  // =================================
+  // UPDATE PIT DISPLAY
+  // =================================
+
+  updatePitStopDisplay();
+
+
+  // =================================
+  // SEND ULTRASONIC PULSE
+  // =================================
+
+  digitalWrite(trigPin, LOW);
+
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+
+  delayMicroseconds(10);
+
+  digitalWrite(trigPin, LOW);
+
+
+  // =================================
+  // READ ECHO
+  // =================================
+
+  long duration =
+    pulseIn(
+      echoPin,
+      HIGH,
+      30000
+    );
+
+
+  // =================================
+  // CALCULATE DISTANCE
+  // =================================
+
+  float distance =
+    duration * 0.0343 / 2;
+
+
+  // =================================
+  // OBJECT ENTERS DETECTION AREA
+  // =================================
+
+  if (distance > 0 &&
+      distance <= detectionDistance) {
+
+    if (!checkingObject &&
+        !objectDetected) {
+
+      checkingObject = true;
+
+      detectionStartTime = millis();
+    }
+
+
+    // =================================
+    // OBJECT DETECTED FOR 75 ms
+    // =================================
+
+    if (checkingObject &&
+        !objectDetected &&
+        millis() - detectionStartTime >=
+        minimumDetectionTime) {
+
+      objectDetected = true;
+
+      checkingObject = false;
+
+      Serial.println();
+
+      Serial.println("ULTRASONIC LAP");
+
+      recordLap();
+    }
+  }
+
+
+  // =================================
+  // OBJECT LEAVES DETECTION AREA
+  // =================================
+
+  else {
+
+    checkingObject = false;
+
+    objectDetected = false;
+  }
+
+
+  delay(20);
+}
