@@ -1,0 +1,475 @@
+// FORMULA SAE - Arduino Uno / ViewMarq four-stat lap timer
+// LCD: 12,11,5,4,3,2 | Ultrasonic: 9,10 | IR: 6 | RS232 Pal TX: 7
+// ViewMarq: 38400 baud, 8O1 | USB Serial Monitor: 115200
+// Timer1 transmits RS232; IRremote uses Timer2.
+
+#include <Arduino.h>
+#include <LiquidCrystal.h>
+#define IR_USE_AVR_TIMER2
+#include <IRremote.hpp>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/pgmspace.h>
+#include <stdio.h>
+#include <string.h>
+
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+const byte TRIG_PIN = 9, ECHO_PIN = 10, IR_PIN = 6;
+const float DETECT_CM = 50.0f;
+const unsigned long DETECTION_HOLD_MS = 75;
+const unsigned long REMOTE_COOLDOWN_MS = 500;
+const unsigned long LCD_MS = 100;
+const unsigned long LIVE_MS = 100;             // 10 Hz maximum
+const unsigned long PIT_PAGE_MS = 3000;
+const unsigned long COMMAND_GAP_MS = 35;       // gap AFTER previous command finished
+// No periodic clear: layout changes only on a page transition.
+#define VIEWMARQ_REPRO 0 // 1: autonomous SETS soak test; never records laps
+
+bool powerLearned = false, pitLearned = false;
+uint16_t powerCode = 69, pitCode = 68, remoteAddress = 0;
+decode_type_t remoteProtocol = UNKNOWN;
+unsigned long lastPowerAt = 0, lastPitAt = 0;
+int lapCount = 0, bestLapNumber = 0, worstLapNumber = 0;
+unsigned long lapStart = 0, lastLapMs = 0, bestLapMs = 0;
+unsigned long worstLapMs = 0, sumLapMs = 0;
+bool timerRunning = false, inPitStop = false, stopAfterLap = false;
+bool checkingObject = false, objectDetected = false;
+unsigned long detectStart = 0, lastLCDAt = 0, lastPitPageAt = 0;
+byte pitPage = 0;
+
+// ------------------- INTERRUPT-DRIVEN 8O1 RS232 ON D7 -------------------
+const uint16_t BIT_TICKS = (F_CPU + 19200UL) / 38400UL;
+// Stage a whole transaction before enabling TX. No FIFO waits or partial enqueue.
+const byte TX_SIZE = 160;
+uint16_t txFrames[TX_SIZE];
+volatile byte txLength = 0;
+volatile byte txRead = 0, txBits = 0;
+volatile uint16_t txFrame = 0;
+volatile uint16_t txLateMax = 0, txRescheduled = 0;
+bool txOverflow = false;
+bool traceNext = false, traceThis = false;
+
+ISR(TIMER1_COMPA_vect) {
+  uint16_t scheduled = OCR1A;
+  uint16_t late = TCNT1 - scheduled;
+  if (late > txLateMax) txLateMax = late;
+  uint16_t next = scheduled + BIT_TICKS;
+  // Never write a compare value already passed (which waits a 4.096 ms wrap).
+  if ((int16_t)(next - TCNT1) < 64) {
+    next = TCNT1 + BIT_TICKS;
+    ++txRescheduled;
+  }
+  OCR1A = next;
+  if (!txBits) {
+    if (txRead == txLength) {
+      PORTD |= _BV(PD7);
+      TIMSK1 &= ~_BV(OCIE1A);
+      return;
+    }
+    txFrame = txFrames[txRead++];
+    txBits = 12; // start, eight data, odd parity, two stop/idle bits
+  }
+  if (txFrame & 1) PORTD |= _BV(PD7);
+  else PORTD &= ~_BV(PD7);
+  txFrame >>= 1;
+  --txBits;
+}
+
+bool serialFinished() { return !(TIMSK1 & _BV(OCIE1A)); }
+void beginCommand() {
+  txLength = 0;
+  txOverflow = false;
+  traceThis = traceNext;
+  traceNext = false;
+  if (traceThis) Serial.println(F("TX staged bytes: HEX printable"));
+}
+void queueByte(byte v) {
+  if (txLength >= TX_SIZE) { txOverflow = true; return; }
+  byte odd = 1;
+  for (byte mask = 1; mask; mask <<= 1) if (v & mask) odd ^= 1;
+  txFrames[txLength++] = ((uint16_t)v << 1) | ((uint16_t)odd << 9) | 0xC00;
+  if (traceThis) {
+    if (v < 16) Serial.print('0');
+    Serial.print(v, HEX); Serial.print(' ');
+    if (v >= 32 && v <= 126) Serial.write(v);
+    else Serial.print(F("<CR>"));
+    Serial.println();
+  }
+}
+void queueFlash(PGM_P p) {
+  char c;
+  while ((c = (char)pgm_read_byte(p++)) != 0) queueByte((byte)c);
+}
+void queueRam(const char *s, byte maxChars = 100) {
+  while (*s && maxChars--) queueByte((byte)*s++);
+}
+void endCommand() {
+  if (txOverflow || !txLength) {
+    Serial.println(F("TX transaction rejected: capacity"));
+    return;
+  }
+  byte save = SREG;
+  cli();
+  txRead = txBits = 0;
+  TIFR1 = _BV(OCF1A);
+  OCR1A = TCNT1 + BIT_TICKS;
+  TIMSK1 |= _BV(OCIE1A);
+  SREG = save;
+}
+void setupBoardSerial() {
+  pinMode(7, OUTPUT);
+  digitalWrite(7, HIGH);
+  TCCR1A = 0;
+  TCCR1B = _BV(CS10);
+  TCNT1 = 0;
+  TIMSK1 = 0;
+}
+
+// ------------------------ VIEWMARQ DISPLAY -----------------------------
+// Use plain integer page parameters to avoid Arduino automatic-prototype
+// errors from custom enum types (the error shown on your Mac).
+enum { ASK_POWER, ASK_PLAY, REMOTE_READY, RACE_GRID,
+       PIT_STANDBY, PIT_BEST, PIT_WORST, PIT_AVG };
+byte wantedPage = ASK_POWER;
+int displayedPage = -1;
+char sentCell[4][7] = {{0}};
+byte nextCell = 0;
+unsigned long lastTransactionAt = 0;
+bool firstTransaction = true;
+unsigned long idleSince = 0;
+bool idleTracking = true;
+
+void wantPage(int p) { wantedPage = (byte)p; }
+
+void makeCell(char out[7], byte index, unsigned long liveMs) {
+  char label = (index == 1) ? 'L' : ((index == 2) ? 'B' : 'W');
+  bool exists = (index == 0) || (index == 1 && lapCount > 1) ||
+                (index == 2 && bestLapNumber > 0) ||
+                (index == 3 && worstLapNumber > 0);
+  unsigned long ms = (index == 0) ? liveMs : (index == 1 ? lastLapMs :
+                      (index == 2 ? bestLapMs : worstLapMs));
+  unsigned long sec = ms / 1000UL;
+  unsigned long tenth = (ms % 1000UL) / 100UL;
+  if (!exists) snprintf(out, 7, "%c:--.-", label);
+  else if (index == 0) {
+    char sep = stopAfterLap ? '*' : ':';
+    if (lapCount < 10) {
+      if (sec < 100) snprintf(out, 7, "%d%c%02lu.%lu", lapCount, sep, sec, tenth);
+      else if (sec < 1000) snprintf(out, 7, "%d%c%03lu", lapCount, sep, sec);
+      else snprintf(out, 7, "%d%c999+", lapCount, sep);
+    } else if (lapCount < 100) {
+      if (sec < 100 && !stopAfterLap)
+        snprintf(out, 7, "%02d%02lu.%lu", lapCount, sec, tenth);
+      else if (sec < 100) snprintf(out, 7, "%02d*%02lu", lapCount, sec);
+      else if (sec < 1000) snprintf(out, 7, "%02d%c%03lu", lapCount, sep, sec);
+      else snprintf(out, 7, "%02d999+", lapCount);
+    } else if (lapCount < 1000 && sec < 100)
+      snprintf(out, 7, "%03d%c%02lu", lapCount, sep, sec);
+    else if (lapCount < 1000 && sec < 1000)
+      snprintf(out, 7, "%03d%03lu", lapCount, sec);
+    else snprintf(out, 7, "L%05d", lapCount % 100000);
+  } else if (sec < 100) snprintf(out, 7, "%c:%02lu.%lu", label, sec, tenth);
+  else if (sec < 1000) snprintf(out, 7, "%c:%03lus", label, sec);
+  else if (sec < 10000) snprintf(out, 7, "%c:%04lu", label, sec);
+  else snprintf(out, 7, "%c:999+", label);
+
+  byte n = strlen(out);
+  while (n < 6) out[n++] = ' ';
+  out[6] = 0;
+}
+
+void sendGridLayout() {
+  queueFlash(PSTR("<ID 1><CLR><CS 0><LJ><BL N>"
+    "<POS 0 0><GRN><STR 1 6><POS 36 0><AMB><STR 2 6>"
+    "<POS 0 8><GRN><STR 3 6><POS 36 8><RED><STR 4 6>\r"));
+  for (byte i = 0; i < 4; i++) sentCell[i][0] = 0;
+  nextCell = 0;
+}
+void sendSetCell(byte index, const char *value) {
+  queueFlash(PSTR("<SETS "));
+  queueByte('1' + index);
+  queueFlash(PSTR(">"));
+  queueRam(value, 6);
+  queueFlash(PSTR("</SETS>"));
+}
+void timeLabel(char out[13], const char *label, unsigned long ms) {
+  unsigned long sec = ms / 1000UL;
+  if (sec < 1000)
+    snprintf(out, 13, "%s %lu.%02lus", label, sec, (ms % 1000UL) / 10UL);
+  else snprintf(out, 13, "%s %lus", label, sec);
+}
+void pitText(int page, char top[13], char bottom[13]) {
+  top[0] = 0;
+  bottom[0] = 0;
+  if (page == ASK_POWER) { strcpy(top, "PRESS POWER"); strcpy(bottom, "ON IR REMOTE"); }
+  else if (page == ASK_PLAY) { strcpy(top, "POWER SAVED"); strcpy(bottom, "PRESS PLAY"); }
+  else if (page == REMOTE_READY) { strcpy(top, "REMOTE READY"); strcpy(bottom, "LAP TIMER"); }
+  else if (page == PIT_STANDBY) { strcpy(top, "PIT STOP"); strcpy(bottom, "STAND BY"); }
+  else if (page == PIT_BEST) {
+    snprintf(top, 13, "BEST LAP %d", bestLapNumber);
+    timeLabel(bottom, "TIME", bestLapMs);
+  } else if (page == PIT_WORST) {
+    snprintf(top, 13, "WORST LAP %d", worstLapNumber);
+    timeLabel(bottom, "TIME", worstLapMs);
+  } else if (page == PIT_AVG) {
+    unsigned long avg = lapCount > 1 ? sumLapMs / (lapCount - 1) : 0;
+    timeLabel(top, "AVG", avg);
+    timeLabel(bottom, "LAST", lastLapMs);
+  }
+}
+void sendTwoLinePage(int page) {
+  char top[13], bottom[13];
+  pitText(page, top, bottom);
+  queueFlash(PSTR("<ID 1><CLR><CS 0><LJ><BL N>"));
+  if (page == PIT_STANDBY) queueFlash(PSTR("<AMB>"));
+  else queueFlash(PSTR("<GRN>"));
+  queueFlash(PSTR("<POS 0 0><T>"));
+  queueRam(top, 12);
+  queueFlash(PSTR("</T><POS 0 8><T>"));
+  queueRam(bottom, 12);
+  queueFlash(PSTR("</T>\r"));
+}
+
+void serviceBoard() {
+  unsigned long now = millis();
+  if (!serialFinished()) { idleTracking = false; return; }
+  if (!idleTracking) { idleSince = now; idleTracking = true; }
+  if (!firstTransaction && now - lastTransactionAt < LIVE_MS) return;
+  if (!firstTransaction && now - idleSince < COMMAND_GAP_MS) return;
+  if (!IrReceiver.isIdle()) return;
+  bool rebuild = displayedPage != (int)wantedPage;
+  if (rebuild) {
+    beginCommand();
+    if (wantedPage == RACE_GRID) sendGridLayout();
+    else sendTwoLinePage(wantedPage);
+    displayedPage = wantedPage;
+  } else {
+    if (wantedPage != RACE_GRID) return;
+    unsigned long live = timerRunning ? now - lapStart : 0;
+    char cells[4][7];
+    bool changed = false;
+    for (byte i = 0; i < 4; ++i) {
+      makeCell(cells[i], i, live);
+      if (strcmp(cells[i], sentCell[i])) changed = true;
+    }
+    if (!changed) return;
+    beginCommand();
+    queueFlash(PSTR("<ID 1>"));
+    // One addressed transaction includes all changed variables, one final CR.
+    for (byte i = 0; i < 4; ++i) {
+      if (!strcmp(cells[i], sentCell[i])) continue;
+      sendSetCell(i, cells[i]);
+      strcpy(sentCell[i], cells[i]);
+    }
+    queueByte('\r');
+  }
+  endCommand();
+  lastTransactionAt = millis(); // actual launch, after optional trace output
+  firstTransaction = false;
+  idleTracking = false;
+}
+
+// USB diagnostics never reset race statistics. No automatic recovery clears.
+void serviceDiagnostics() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  if (c == 't') traceNext = true; // one transaction only; verbose trace alters cadence
+  if (c == 'r') displayedPage = -1; // explicit layout recovery after TX finishes
+  if (c == 'd') {
+    byte save = SREG; cli();
+    uint16_t late = txLateMax, rescheduled = txRescheduled;
+    SREG = save;
+    Serial.print(F("TX max entry lateness ticks (16/us): ")); Serial.println(late);
+    Serial.print(F("TX missed-deadline reschedules: ")); Serial.println(rescheduled);
+  }
+}
+
+// ------------------------- SMALL LCD / LAP LOGIC -------------------------
+void showLCDLive(unsigned long ms) {
+  lcd.setCursor(0, 0);
+  lcd.print(F("LAP: ")); lcd.print(lapCount);
+  if (stopAfterLap) lcd.print(F(" *"));
+  lcd.print(F("        "));
+  lcd.setCursor(0, 1);
+  lcd.print(F("TIME: ")); lcd.print(ms / 1000.0, 2); lcd.print(F(" s   "));
+}
+void showLCDPit() {
+  lcd.clear();
+  if (pitPage == 0) {
+    lcd.setCursor(0, 0); lcd.print(F("PIT STOP"));
+    lcd.setCursor(0, 1); lcd.print(F("STAND BY"));
+  } else if (pitPage == 1) {
+    lcd.setCursor(0, 0); lcd.print(F("BEST LAP: ")); lcd.print(bestLapNumber);
+    lcd.setCursor(0, 1); lcd.print(F("TIME: ")); lcd.print(bestLapMs / 1000.0, 2); lcd.print(F(" s"));
+  } else if (pitPage == 2) {
+    lcd.setCursor(0, 0); lcd.print(F("WORST LAP: ")); lcd.print(worstLapNumber);
+    lcd.setCursor(0, 1); lcd.print(F("TIME: ")); lcd.print(worstLapMs / 1000.0, 2); lcd.print(F(" s"));
+  } else {
+    unsigned long avg = lapCount > 1 ? sumLapMs / (lapCount - 1) : 0;
+    lcd.setCursor(0, 0); lcd.print(F("AVG: ")); lcd.print(avg / 1000.0, 2); lcd.print(F(" s"));
+    lcd.setCursor(0, 1); lcd.print(F("RECENT: ")); lcd.print(lastLapMs / 1000.0, 2); lcd.print(F(" s"));
+  }
+}
+void resetStats() {
+  lapCount = 0; bestLapNumber = 0; worstLapNumber = 0;
+  lastLapMs = 0; bestLapMs = 0; worstLapMs = 0; sumLapMs = 0;
+}
+void startRace() {
+  resetStats();
+  lapCount = 1; timerRunning = true; inPitStop = false; stopAfterLap = false;
+  lapStart = millis(); lastLCDAt = lapStart;
+  lcd.clear(); showLCDLive(0);
+  wantPage(RACE_GRID);
+  Serial.println(F("NEW RACE STARTED"));
+}
+void resumeRace() {
+  timerRunning = true; inPitStop = false; stopAfterLap = false;
+  lapStart = millis(); lastLCDAt = lapStart;
+  lcd.clear(); showLCDLive(0);
+  wantPage(RACE_GRID);
+  Serial.print(F("PIT STOP COMPLETE - RESUMING LAP ")); Serial.println(lapCount);
+}
+void enterPit() {
+  timerRunning = false; inPitStop = true; stopAfterLap = false;
+  pitPage = 0; lastPitPageAt = millis();
+  showLCDPit(); wantPage(PIT_STANDBY);
+  Serial.println(F("PIT STOP - TIMER STOPPED"));
+}
+void recordLap() {
+  unsigned long now = millis();
+  if (!timerRunning) {
+    if (inPitStop) resumeRace();
+    else startRace();
+    return;
+  }
+  unsigned long finished = now - lapStart;
+  lastLapMs = finished; sumLapMs += finished;
+  if (bestLapMs == 0 || finished < bestLapMs) {
+    bestLapMs = finished; bestLapNumber = lapCount;
+  }
+  if (finished > worstLapMs) {
+    worstLapMs = finished; worstLapNumber = lapCount;
+  }
+  Serial.print(F("Lap ")); Serial.print(lapCount);
+  Serial.print(F(": ")); Serial.print(finished / 1000.0, 2); Serial.println(F(" seconds"));
+  Serial.print(F("Most recent: ")); Serial.println(lastLapMs / 1000.0, 2);
+  Serial.print(F("Best: ")); Serial.println(bestLapMs / 1000.0, 2);
+  Serial.print(F("Worst: ")); Serial.println(worstLapMs / 1000.0, 2);
+  Serial.print(F("Average: "));
+  Serial.println(((float)sumLapMs / lapCount) / 1000.0, 2);
+  Serial.println(F("----------------"));
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(F("LAP: ")); lcd.print(lapCount);
+  lcd.setCursor(0, 1); lcd.print(F("TIME: ")); lcd.print(finished / 1000.0, 2); lcd.print(F(" s"));
+  lapStart = now; lapCount++;
+  if (stopAfterLap) enterPit(); // otherwise change four grid values in-place
+}
+
+// ---------------------------- IR REMOTE ---------------------------------
+void learnRemote(uint16_t cmd, uint16_t address, decode_type_t protocol) {
+  if (!powerLearned) {
+    powerCode = cmd; remoteAddress = address; remoteProtocol = protocol;
+    powerLearned = true;
+    lcd.clear(); lcd.setCursor(0, 0); lcd.print(F("POWER SAVED"));
+    lcd.setCursor(0, 1); lcd.print(F("PRESS PLAY/PAUSE"));
+    wantPage(ASK_PLAY);
+    Serial.print(F("POWER BUTTON LEARNED: ")); Serial.println(cmd);
+    return;
+  }
+  if (!pitLearned) {
+    if (cmd == powerCode && address == remoteAddress && protocol == remoteProtocol) {
+      Serial.println(F("PRESS PLAY/PAUSE INSTEAD")); return;
+    }
+    if (address != remoteAddress || protocol != remoteProtocol) {
+      Serial.println(F("DIFFERENT REMOTE")); return;
+    }
+    pitCode = cmd; pitLearned = true;
+    lcd.clear(); lcd.setCursor(0, 0); lcd.print(F("REMOTE READY"));
+    lcd.setCursor(0, 1); lcd.print(F("LAP TIMER READY"));
+    wantPage(REMOTE_READY);
+    Serial.print(F("PLAY/PAUSE BUTTON LEARNED: ")); Serial.println(cmd);
+    Serial.println(F("REMOTE READY"));
+  }
+}
+void checkRemote() {
+  if (!IrReceiver.decode()) return;
+  uint16_t cmd = IrReceiver.decodedIRData.command;
+  uint16_t address = IrReceiver.decodedIRData.address;
+  decode_type_t protocol = IrReceiver.decodedIRData.protocol;
+  bool repeated = IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT;
+  IrReceiver.resume();
+  if (repeated || protocol == UNKNOWN) return;
+  Serial.print(F("IR COMMAND: ")); Serial.println(cmd);
+  if (!powerLearned || !pitLearned) { learnRemote(cmd, address, protocol); return; }
+  if (address != remoteAddress || protocol != remoteProtocol) {
+    Serial.println(F("REMOTE MISMATCH")); return;
+  }
+  unsigned long now = millis();
+  if (cmd == powerCode && now - lastPowerAt >= REMOTE_COOLDOWN_MS) {
+    lastPowerAt = now; Serial.println(F("MANUAL LAP - POWER")); recordLap();
+  } else if (cmd == pitCode && now - lastPitAt >= REMOTE_COOLDOWN_MS) {
+    lastPitAt = now;
+    if (inPitStop) resumeRace();
+    else if (timerRunning) {
+      stopAfterLap = true;
+      lcd.clear(); lcd.setCursor(0, 0); lcd.print(F("LAP: ")); lcd.print(lapCount); lcd.print(F(" *"));
+      lcd.setCursor(0, 1); lcd.print(F("PIT AFTER LAP"));
+      Serial.println(F("PIT REQUESTED - FINISH CURRENT LAP"));
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  lcd.begin(16, 2);
+  lcd.setCursor(0, 0); lcd.print(F("PRESS POWER"));
+  lcd.setCursor(0, 1); lcd.print(F("ON IR REMOTE"));
+  IrReceiver.begin(IR_PIN, ENABLE_LED_FEEDBACK);
+  setupBoardSerial();
+  idleSince = millis() - COMMAND_GAP_MS;
+  Serial.println(F("E21-R1 - 10 HZ BATCHED / D7 38400 8O1"));
+  Serial.println(F("USB: d=TX timing, t=trace next command, r=rebuild display only"));
+  Serial.println(F("LEARN POWER, THEN PLAY/PAUSE"));
+}
+void loop() {
+  serviceDiagnostics();
+#if VIEWMARQ_REPRO
+  // Same TX and dashboard grammar, deterministic 10 Hz values for a soak test.
+  timerRunning = true; lapCount = 10; bestLapNumber = worstLapNumber = 1;
+  lastLapMs = 99900UL; bestLapMs = 100000UL; worstLapMs = 500000UL;
+  wantPage(RACE_GRID);
+  serviceBoard();
+  return;
+#endif
+  checkRemote();
+  serviceBoard();
+  unsigned long now = millis();
+  if (timerRunning && now - lastLCDAt >= LCD_MS) {
+    lastLCDAt = now; showLCDLive(now - lapStart);
+  }
+  if (inPitStop && now - lastPitPageAt >= PIT_PAGE_MS) {
+    lastPitPageAt = now; pitPage = (pitPage + 1) & 3;
+    showLCDPit(); wantPage(PIT_STANDBY + pitPage);
+  }
+  static unsigned long lastSensorAt = 0;
+  if (now - lastSensorAt < 20) return;
+  lastSensorAt = now;
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 8000);
+  float distance = duration * 0.0343f / 2.0f;
+  if (distance > 0 && distance <= DETECT_CM) {
+    if (!checkingObject && !objectDetected) {
+      checkingObject = true; detectStart = millis();
+    }
+    if (checkingObject && !objectDetected &&
+        millis() - detectStart >= DETECTION_HOLD_MS) {
+      objectDetected = true; checkingObject = false;
+      Serial.println(F("ULTRASONIC LAP")); recordLap();
+    }
+  } else { checkingObject = false; objectDetected = false; }
+
+}
+
