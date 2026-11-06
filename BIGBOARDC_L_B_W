@@ -1,0 +1,933 @@
+
+#include <LiquidCrystal.h>
+#define IR_USE_AVR_TIMER2
+#include <IRremote.hpp>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+
+// FORMULA SAE LAP TIMER
+// LCD: 12,11,5,4,3,2
+// Ultrasonic: Trig 9, Echo 10
+// IR remote: D6
+// ViewMarq RS232 Pal: D7
+// ViewMarq: 38400 baud, 8O1
+
+LiquidCrystal lcd(12, 11, 5, 4, 3, 2);
+
+const uint8_t TRIG_PIN = 9;
+const uint8_t ECHO_PIN = 10;
+const uint8_t IR_PIN = 6;
+
+const float DETECTION_CM = 50.0;
+const unsigned long DETECTION_HOLD_MS = 75;
+const unsigned long REMOTE_COOLDOWN_MS = 500;
+const unsigned long LCD_PERIOD_MS = 100;
+const unsigned long BOARD_PERIOD_MS = 100; // 10 Hz
+const unsigned long PIT_PAGE_MS = 3000;
+
+// Remote settings
+bool powerLearned = false;
+bool pitLearned = false;
+
+uint16_t powerCode = 69;
+uint16_t pitCode = 68;
+uint16_t learnedAddress = 0;
+decode_type_t learnedProtocol = UNKNOWN;
+
+unsigned long lastPowerPress = 0;
+unsigned long lastPitPress = 0;
+
+// Lap statistics
+int lapCount = 0;
+int bestLapNumber = 0;
+int worstLapNumber = 0;
+
+unsigned long lapStartedAt = 0;
+unsigned long lastLapMs = 0;
+unsigned long bestLapMs = 0;
+unsigned long worstLapMs = 0;
+unsigned long totalLapMs = 0;
+
+bool timerRunning = false;
+bool inPitStop = false;
+bool stopAfterLap = false;
+
+// Sensor detection
+bool objectDetected = false;
+bool checkingObject = false;
+unsigned long detectionStartedAt = 0;
+
+// Display timing
+unsigned long lastLCDUpdate = 0;
+unsigned long lastBoardUpdate = 0;
+unsigned long lastPitPageUpdate = 0;
+uint8_t pitPage = 0;
+
+// ========================================
+// NONBLOCKING RS-232 TRANSMITTER
+// Timer1 sends each bit using interrupts.
+// IR remote uses Timer2.
+// ========================================
+
+const uint16_t BIT_TICKS =
+    (F_CPU + 38400UL / 2) / 38400UL;
+
+const uint8_t TX_SIZE = 128;
+
+volatile uint8_t txQueue[TX_SIZE];
+volatile uint8_t txHead = 0;
+volatile uint8_t txTail = 0;
+
+volatile uint8_t txStep = 0;
+volatile uint8_t txData = 0;
+volatile uint8_t txParity = 1;
+
+ISR(TIMER1_COMPA_vect) {
+  OCR1A += BIT_TICKS;
+
+  if (txStep == 0) {
+    if (txHead == txTail) {
+      PORTD |= _BV(PD7);
+      TIMSK1 &= ~_BV(OCIE1A);
+      return;
+    }
+
+    txData = txQueue[txTail];
+    txTail = (txTail + 1) & (TX_SIZE - 1);
+    txParity = 1;
+
+    PORTD &= ~_BV(PD7);
+    txStep = 1;
+    return;
+  }
+
+  if (txStep <= 8) {
+    uint8_t bitValue =
+        (txData >> (txStep - 1)) & 1;
+
+    if (bitValue) {
+      PORTD |= _BV(PD7);
+    } else {
+      PORTD &= ~_BV(PD7);
+    }
+
+    txParity ^= bitValue;
+    txStep++;
+    return;
+  }
+
+  if (txStep == 9) {
+    if (txParity) {
+      PORTD |= _BV(PD7);
+    } else {
+      PORTD &= ~_BV(PD7);
+    }
+
+    txStep = 10;
+    return;
+  }
+
+  PORTD |= _BV(PD7);
+  txStep = 0;
+}
+
+void sendByte(uint8_t b) {
+  while (true) {
+    uint8_t oldSREG = SREG;
+    cli();
+
+    uint8_t next =
+        (txHead + 1) & (TX_SIZE - 1);
+
+    if (next != txTail) {
+      txQueue[txHead] = b;
+      txHead = next;
+
+      if (!(TIMSK1 & _BV(OCIE1A))) {
+        TIFR1 = _BV(OCF1A);
+        OCR1A = TCNT1 + BIT_TICKS;
+        TIMSK1 |= _BV(OCIE1A);
+      }
+
+      SREG = oldSREG;
+      return;
+    }
+
+    SREG = oldSREG;
+  }
+}
+
+void sendText(const char *s) {
+  while (*s) {
+    sendByte((uint8_t)*s++);
+  }
+}
+
+void sendLimited(const char *s, uint8_t limit) {
+  while (*s && limit--) {
+    sendByte((uint8_t)*s++);
+  }
+}
+
+// ========================================
+// VIEWMARQ DISPLAY COMMUNICATION
+// ========================================
+
+void setViewmarqString(
+    uint8_t index,
+    const char *value) {
+
+  sendText("<ID 1><SETS ");
+  sendByte('0' + index);
+  sendText(">");
+
+  sendLimited(value, 12);
+  sendText("</SETS>\r");
+
+  lastBoardUpdate = millis();
+}
+
+bool gridActive = false;
+char oldGrid[4][7] = {{0}};
+
+void showTwoLines(
+    const char *top,
+    const char *bottom,
+    const char *color = "<GRN>") {
+
+  gridActive = false;
+
+  sendText("<ID 1><CLR><CS 0><LJ><BL N>");
+  sendText(color);
+
+  sendText(
+    "<POS 0 0><STR 1 12>"
+    "<POS 0 8><STR 2 12>\r"
+  );
+
+  setViewmarqString(1, top);
+  setViewmarqString(2, bottom);
+}
+
+// ========================================
+// FOUR-STAT DISPLAY FORMATTING
+// ========================================
+
+void formatCell(
+    char out[7],
+    char kind,
+    int lap,
+    unsigned long ms,
+    bool exists,
+    bool pitRequested = false) {
+
+  if (!exists) {
+    snprintf(out, 7, "%c:--.-", kind);
+  } else {
+    unsigned long sec = ms / 1000UL;
+    unsigned long tenth =
+        (ms % 1000UL) / 100UL;
+
+    char sep = pitRequested ? '*' : ':';
+
+    // Current lap, numbers 1-9
+    if (kind == 'C' && lap > 0 && lap < 10) {
+      if (sec < 100) {
+        snprintf(
+          out, 7, "%d%c%02lu.%lu",
+          lap, sep, sec, tenth
+        );
+      } else if (sec < 1000) {
+        snprintf(
+          out, 7, "%d%c%03lu",
+          lap, sep, sec
+        );
+      } else {
+        snprintf(out, 7, "%d%c999+", lap, sep);
+      }
+    }
+
+    // Current lap, numbers 10-99
+    else if (kind == 'C' && lap < 100) {
+      if (sec < 100 && !pitRequested) {
+        snprintf(
+          out, 7, "%02d%02lu.%lu",
+          lap, sec, tenth
+        );
+      } else if (sec < 100) {
+        snprintf(
+          out, 7, "%02d*%02lu",
+          lap, sec
+        );
+      } else if (sec < 1000) {
+        snprintf(
+          out, 7, "%02d%c%03lu",
+          lap, sep, sec
+        );
+      } else {
+        snprintf(out, 7, "%02d999+", lap);
+      }
+    }
+
+    // Current lap, numbers 100+
+    else if (kind == 'C') {
+      if (lap < 1000 && sec < 100) {
+        snprintf(
+          out, 7, "%03d%c%02lu",
+          lap, sep, sec
+        );
+      } else if (lap < 1000 && sec < 1000) {
+        snprintf(
+          out, 7, "%03d%03lu",
+          lap, sec
+        );
+      } else {
+        snprintf(out, 7, "L%05d", lap % 100000);
+      }
+    }
+
+    // Last, Best, Worst
+    else if (sec < 100) {
+      snprintf(
+        out, 7, "%c:%02lu.%lu",
+        kind, sec, tenth
+      );
+    } else if (sec < 1000) {
+      snprintf(
+        out, 7, "%c:%03lus",
+        kind, sec
+      );
+    } else if (sec < 10000) {
+      snprintf(
+        out, 7, "%c:%04lu",
+        kind, sec
+      );
+    } else {
+      snprintf(out, 7, "%c:999+", kind);
+    }
+  }
+
+  uint8_t length = strlen(out);
+
+  while (length < 6) {
+    out[length++] = ' ';
+  }
+
+  out[6] = 0;
+}
+
+void buildGrid(const char cells[4][7]) {
+  sendText("<ID 1><CLR><CS 0><LJ><BL N>");
+
+  sendText("<POS 0 0><GRN><STR 1 6>");
+  sendText("<POS 36 0><AMB><STR 2 6>");
+  sendText("<POS 0 8><GRN><STR 3 6>");
+  sendText("<POS 36 8><RED><STR 4 6>\r");
+
+  for (uint8_t i = 0; i < 4; i++) {
+    setViewmarqString(i + 1, cells[i]);
+    memcpy(oldGrid[i], cells[i], 7);
+  }
+
+  gridActive = true;
+}
+
+void updateGrid(
+    unsigned long elapsedMs,
+    bool force = false) {
+
+  char cells[4][7];
+
+  formatCell(
+    cells[0], 'C', lapCount,
+    elapsedMs, true, stopAfterLap
+  );
+
+  formatCell(
+    cells[1], 'L', lapCount - 1,
+    lastLapMs, lapCount > 1
+  );
+
+  formatCell(
+    cells[2], 'B', bestLapNumber,
+    bestLapMs, bestLapNumber > 0
+  );
+
+  formatCell(
+    cells[3], 'W', worstLapNumber,
+    worstLapMs, worstLapNumber > 0
+  );
+
+  if (force || !gridActive) {
+    buildGrid(cells);
+    return;
+  }
+
+  for (uint8_t i = 0; i < 4; i++) {
+    if (strcmp(cells[i], oldGrid[i]) != 0) {
+      setViewmarqString(i + 1, cells[i]);
+      memcpy(oldGrid[i], cells[i], 7);
+    }
+  }
+}
+
+void initViewmarq() {
+  pinMode(7, OUTPUT);
+  digitalWrite(7, HIGH);
+
+  TCCR1A = 0;
+  TCCR1B = _BV(CS10);
+  TCNT1 = 0;
+
+  TIMSK1 &= ~_BV(OCIE1A);
+}
+
+// ========================================
+// SMALL LCD DISPLAY
+// ========================================
+
+void showLCDLive(unsigned long ms) {
+  lcd.setCursor(0, 0);
+  lcd.print("LAP: ");
+  lcd.print(lapCount);
+
+  if (stopAfterLap) {
+    lcd.print(" *");
+  }
+
+  lcd.print("       ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("TIME: ");
+  lcd.print(ms / 1000.0, 2);
+  lcd.print(" s   ");
+}
+
+// ========================================
+// RACE MANAGEMENT
+// ========================================
+
+void resetStats() {
+  lapCount = 0;
+
+  lastLapMs = 0;
+  bestLapMs = 0;
+  worstLapMs = 0;
+  totalLapMs = 0;
+
+  bestLapNumber = 0;
+  worstLapNumber = 0;
+}
+
+void startNewRace() {
+  resetStats();
+
+  lapCount = 1;
+  timerRunning = true;
+  inPitStop = false;
+  stopAfterLap = false;
+
+  lapStartedAt = millis();
+  lastLCDUpdate = lapStartedAt;
+
+  lcd.clear();
+  showLCDLive(0);
+
+  Serial.println("NEW RACE STARTED");
+
+  updateGrid(0, true);
+}
+
+void resumeAfterPit() {
+  inPitStop = false;
+  timerRunning = true;
+  stopAfterLap = false;
+
+  lapStartedAt = millis();
+  lastLCDUpdate = lapStartedAt;
+
+  lcd.clear();
+  showLCDLive(0);
+
+  Serial.print("PIT STOP COMPLETE - RESUMING LAP ");
+  Serial.println(lapCount);
+
+  updateGrid(0, true);
+}
+
+void enterPitStop() {
+  timerRunning = false;
+  stopAfterLap = false;
+  inPitStop = true;
+
+  pitPage = 0;
+  lastPitPageUpdate = millis();
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("PIT STOP");
+
+  lcd.setCursor(0, 1);
+  lcd.print("STAND BY");
+
+  showTwoLines(
+    "PIT STOP", "STAND BY", "<AMB>"
+  );
+
+  Serial.println("PIT STOP - TIMER STOPPED");
+}
+
+void formatTime(
+    char out[13],
+    const char *label,
+    unsigned long ms) {
+
+  unsigned long sec = ms / 1000UL;
+  unsigned long hundredths =
+      (ms % 1000UL) / 10UL;
+
+  if (sec < 1000) {
+    snprintf(
+      out, 13, "%s %lu.%02lus",
+      label, sec, hundredths
+    );
+  } else {
+    snprintf(
+      out, 13, "%s %lus",
+      label, sec
+    );
+  }
+}
+
+// ========================================
+// PIT-STOP STATISTICS
+// ========================================
+
+void showPitPage() {
+  char top[13], bottom[13];
+
+  lcd.clear();
+
+  if (pitPage == 0) {
+    lcd.setCursor(0, 0);
+    lcd.print("PIT STOP");
+
+    lcd.setCursor(0, 1);
+    lcd.print("STAND BY");
+
+    showTwoLines(
+      "PIT STOP", "STAND BY", "<AMB>"
+    );
+  }
+
+  else if (pitPage == 1) {
+    lcd.setCursor(0, 0);
+    lcd.print("BEST LAP: ");
+    lcd.print(bestLapNumber);
+
+    lcd.setCursor(0, 1);
+    lcd.print("TIME: ");
+    lcd.print(bestLapMs / 1000.0, 2);
+    lcd.print(" s");
+
+    snprintf(
+      top, sizeof(top),
+      "BEST LAP %d", bestLapNumber
+    );
+
+    formatTime(bottom, "TIME", bestLapMs);
+    showTwoLines(top, bottom);
+  }
+
+  else if (pitPage == 2) {
+    lcd.setCursor(0, 0);
+    lcd.print("WORST LAP: ");
+    lcd.print(worstLapNumber);
+
+    lcd.setCursor(0, 1);
+    lcd.print("TIME: ");
+    lcd.print(worstLapMs / 1000.0, 2);
+    lcd.print(" s");
+
+    snprintf(
+      top, sizeof(top),
+      "WORST LAP %d", worstLapNumber
+    );
+
+    formatTime(bottom, "TIME", worstLapMs);
+    showTwoLines(top, bottom);
+  }
+
+  else {
+    unsigned long avg =
+        lapCount > 1
+        ? totalLapMs / (lapCount - 1)
+        : 0;
+
+    lcd.setCursor(0, 0);
+    lcd.print("AVG: ");
+    lcd.print(avg / 1000.0, 2);
+    lcd.print(" s");
+
+    lcd.setCursor(0, 1);
+    lcd.print("RECENT: ");
+    lcd.print(lastLapMs / 1000.0, 2);
+    lcd.print(" s");
+
+    formatTime(top, "AVG", avg);
+    formatTime(bottom, "LAST", lastLapMs);
+
+    showTwoLines(top, bottom);
+  }
+}
+
+// ========================================
+// RECORD COMPLETED LAP
+// ========================================
+
+void recordLap() {
+  unsigned long now = millis();
+
+  if (!timerRunning) {
+    if (inPitStop) {
+      resumeAfterPit();
+    } else {
+      startNewRace();
+    }
+    return;
+  }
+
+  unsigned long lapMs =
+      now - lapStartedAt;
+
+  lastLapMs = lapMs;
+  totalLapMs += lapMs;
+
+  if (bestLapMs == 0 || lapMs < bestLapMs) {
+    bestLapMs = lapMs;
+    bestLapNumber = lapCount;
+  }
+
+  if (lapMs > worstLapMs) {
+    worstLapMs = lapMs;
+    worstLapNumber = lapCount;
+  }
+
+  float avg =
+      (float)totalLapMs / lapCount;
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("LAP: ");
+  lcd.print(lapCount);
+
+  lcd.setCursor(0, 1);
+  lcd.print("TIME: ");
+  lcd.print(lapMs / 1000.0, 2);
+  lcd.print(" s");
+
+  Serial.print("Lap ");
+  Serial.print(lapCount);
+  Serial.print(": ");
+  Serial.print(lapMs / 1000.0, 2);
+  Serial.println(" seconds");
+
+  Serial.print("Most recent: ");
+  Serial.println(lastLapMs / 1000.0, 2);
+
+  Serial.print("Best: ");
+  Serial.println(bestLapMs / 1000.0, 2);
+
+  Serial.print("Worst: ");
+  Serial.println(worstLapMs / 1000.0, 2);
+
+  Serial.print("Average: ");
+  Serial.println(avg / 1000.0, 2);
+
+  Serial.println("----------------");
+
+  lapStartedAt = now;
+  lapCount++;
+
+  if (stopAfterLap) {
+    enterPitStop();
+  } else {
+    // Update values without clearing screen
+    updateGrid(0);
+  }
+}
+
+// ========================================
+// LEARN IR REMOTE BUTTONS
+// ========================================
+
+void learnButton(
+    uint16_t command,
+    uint16_t address,
+    decode_type_t protocol) {
+
+  if (!powerLearned) {
+    powerCode = command;
+    learnedAddress = address;
+    learnedProtocol = protocol;
+    powerLearned = true;
+
+    Serial.print("POWER BUTTON LEARNED: ");
+    Serial.println(powerCode);
+
+    Serial.println("NOW PRESS PLAY/PAUSE");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("POWER SAVED");
+
+    lcd.setCursor(0, 1);
+    lcd.print("PRESS PLAY/PAUSE");
+
+    showTwoLines(
+      "POWER SAVED", "PRESS PLAY"
+    );
+    return;
+  }
+
+  if (!pitLearned) {
+    if (command == powerCode &&
+        address == learnedAddress &&
+        protocol == learnedProtocol) {
+
+      Serial.println("PRESS PLAY/PAUSE INSTEAD");
+      return;
+    }
+
+    if (address != learnedAddress ||
+        protocol != learnedProtocol) {
+
+      Serial.println("DIFFERENT REMOTE DETECTED");
+      return;
+    }
+
+    pitCode = command;
+    pitLearned = true;
+
+    Serial.print("PLAY/PAUSE BUTTON LEARNED: ");
+    Serial.println(pitCode);
+
+    Serial.println("REMOTE READY");
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("REMOTE READY");
+
+    lcd.setCursor(0, 1);
+    lcd.print("LAP TIMER READY");
+
+    showTwoLines(
+      "REMOTE READY", "LAP TIMER"
+    );
+  }
+}
+
+// ========================================
+// IR REMOTE BUTTON PROCESSING
+// ========================================
+
+void checkRemote() {
+  if (!IrReceiver.decode()) {
+    return;
+  }
+
+  uint16_t cmd =
+      IrReceiver.decodedIRData.command;
+
+  uint16_t addr =
+      IrReceiver.decodedIRData.address;
+
+  decode_type_t protocol =
+      IrReceiver.decodedIRData.protocol;
+
+  bool repeat =
+      IrReceiver.decodedIRData.flags &
+      IRDATA_FLAGS_IS_REPEAT;
+
+  // Re-arm receiver before display updates
+  IrReceiver.resume();
+
+  if (repeat || protocol == UNKNOWN) {
+    return;
+  }
+
+  Serial.print("IR COMMAND: ");
+  Serial.println(cmd);
+
+  Serial.print("IR ADDRESS: ");
+  Serial.println(addr);
+
+  if (!powerLearned || !pitLearned) {
+    learnButton(cmd, addr, protocol);
+    return;
+  }
+
+  if (addr != learnedAddress ||
+      protocol != learnedProtocol) {
+
+    Serial.println(
+      "IGNORED: REMOTE ADDRESS/PROTOCOL CHANGED"
+    );
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (cmd == powerCode &&
+      now - lastPowerPress >= REMOTE_COOLDOWN_MS) {
+
+    lastPowerPress = now;
+
+    Serial.println("MANUAL LAP - POWER");
+    recordLap();
+  }
+
+  else if (cmd == pitCode &&
+           now - lastPitPress >= REMOTE_COOLDOWN_MS) {
+
+    lastPitPress = now;
+
+    if (inPitStop) {
+      Serial.println("PIT STOP RESUME");
+      resumeAfterPit();
+    }
+
+    else if (timerRunning) {
+      Serial.println(
+        "PIT STOP REQUESTED - FINISH CURRENT LAP"
+      );
+
+      stopAfterLap = true;
+
+      updateGrid(millis() - lapStartedAt);
+
+      lcd.clear();
+
+      lcd.setCursor(0, 0);
+      lcd.print("LAP: ");
+      lcd.print(lapCount);
+      lcd.print(" *");
+
+      lcd.setCursor(0, 1);
+      lcd.print("PIT AFTER LAP");
+    }
+  }
+}
+
+// ========================================
+// SETUP
+// ========================================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  IrReceiver.begin(
+    IR_PIN, ENABLE_LED_FEEDBACK
+  );
+
+  lcd.begin(16, 2);
+
+  lcd.setCursor(0, 0);
+  lcd.print("PRESS POWER");
+
+  lcd.setCursor(0, 1);
+  lcd.print("ON IR REMOTE");
+
+  initViewmarq();
+
+  showTwoLines(
+    "PRESS POWER", "ON IR REMOTE"
+  );
+
+  Serial.println("LAP TIMER READY");
+  Serial.println("LEARN POWER, THEN PLAY/PAUSE");
+}
+
+// ========================================
+// MAIN LOOP
+// ========================================
+
+void loop() {
+  // Give remote first chance to respond
+  checkRemote();
+
+  unsigned long now = millis();
+
+  // Live timer and big board
+  if (timerRunning) {
+
+    if (now - lastLCDUpdate >= LCD_PERIOD_MS) {
+      lastLCDUpdate = now;
+      showLCDLive(now - lapStartedAt);
+    }
+
+    if (now - lastBoardUpdate >= BOARD_PERIOD_MS &&
+        IrReceiver.isIdle()) {
+
+      updateGrid(now - lapStartedAt);
+    }
+  }
+
+  // Pit-stop statistic rotation
+  if (inPitStop &&
+      now - lastPitPageUpdate >= PIT_PAGE_MS) {
+
+    lastPitPageUpdate = now;
+    pitPage = (pitPage + 1) % 4;
+    showPitPage();
+  }
+
+  // Ultrasonic sensor
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration =
+      pulseIn(ECHO_PIN, HIGH, 8000);
+
+  float distance =
+      duration * 0.0343 / 2.0;
+
+  if (distance > 0 &&
+      distance <= DETECTION_CM) {
+
+    if (!checkingObject && !objectDetected) {
+      checkingObject = true;
+      detectionStartedAt = millis();
+    }
+
+    if (checkingObject &&
+        !objectDetected &&
+        millis() - detectionStartedAt >=
+        DETECTION_HOLD_MS) {
+
+      objectDetected = true;
+      checkingObject = false;
+
+      Serial.println("ULTRASONIC LAP");
+      recordLap();
+    }
+  }
+
+  else {
+    checkingObject = false;
+    objectDetected = false;
+  }
+
+  delay(20);
+}
